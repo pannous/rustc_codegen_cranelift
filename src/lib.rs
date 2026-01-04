@@ -239,8 +239,20 @@ fn enable_verifier(sess: &Session) -> bool {
 }
 
 fn target_triple(sess: &Session) -> target_lexicon::Triple {
-    match sess.target.llvm_target.parse() {
-        Ok(triple) => triple,
+    match sess.target.llvm_target.parse::<target_lexicon::Triple>() {
+        Ok(mut triple) => {
+            // Handle freestanding targets like aarch64-unknown-none and x86_64-unknown-none
+            // which don't specify a binary format. Check data-layout for "m:e" (ELF) or "m:o" (Mach-O)
+            if triple.binary_format == target_lexicon::BinaryFormat::Unknown {
+                let data_layout = &sess.target.data_layout;
+                if data_layout.contains("-m:e-") || data_layout.starts_with("e-m:e-") {
+                    triple.binary_format = target_lexicon::BinaryFormat::Elf;
+                } else if data_layout.contains("-m:o-") || data_layout.starts_with("e-m:o-") {
+                    triple.binary_format = target_lexicon::BinaryFormat::Macho;
+                }
+            }
+            triple
+        }
         Err(err) => sess.dcx().fatal(format!("target not recognized: {}", err)),
     }
 }
