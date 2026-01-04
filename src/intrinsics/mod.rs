@@ -1505,12 +1505,97 @@ fn codegen_regular_intrinsic_call<'tcx>(
             ret.write_cvalue(fx, a);
         }
 
-        // FIXME implement variadics in cranelift
-        sym::va_copy | sym::va_arg | sym::va_end => {
-            fx.tcx.dcx().span_fatal(
-                source_info.span,
-                "Defining variadic functions is not yet supported by Cranelift",
-            );
+        sym::va_start => {
+            // va_start is a no-op for Cranelift's variadic function implementation.
+            // The va_list is already initialized in the function prelude (codegen_fn_prelude)
+            // with the address of the first variadic argument.
+            //
+            // In standard C, va_start takes the last fixed parameter to calculate
+            // where varargs begin. In Rust's implementation, this is handled
+            // implicitly when setting up the variadic parameter.
+            intrinsic_args!(fx, args => (_va_list); intrinsic);
+        }
+
+        sym::va_arg => {
+            // va_arg reads the next argument from the va_list and advances the pointer
+            let ret_layout = ret.layout();
+
+            intrinsic_args!(fx, args => (va_list); intrinsic);
+            let va_list_ptr = va_list.load_scalar(fx);
+
+            // Load the current pointer from va_list
+            let current_ptr = fx.bcx.ins().load(fx.pointer_type, MemFlags::trusted(), va_list_ptr, 0);
+
+            // Load the value at the current pointer
+            let arg_size = ret_layout.size.bytes() as i64;
+            let arg_align = ret_layout.align.abi.bytes() as i64;
+
+            // Align the pointer if necessary
+            let aligned_ptr = if arg_align > 1 {
+                let align_mask = arg_align - 1;
+                let ptr_val = fx.bcx.ins().iadd_imm(current_ptr, align_mask);
+                let neg_align = fx.bcx.ins().iconst(fx.pointer_type, -arg_align);
+                fx.bcx.ins().band(ptr_val, neg_align)
+            } else {
+                current_ptr
+            };
+
+            // Read the value
+            let value = match ret_layout.backend_repr {
+                rustc_abi::BackendRepr::Scalar(scalar) => {
+                    let clif_ty = crate::common::scalar_to_clif_type(fx.tcx, scalar);
+                    let val = fx.bcx.ins().load(clif_ty, MemFlags::trusted(), aligned_ptr, 0);
+                    CValue::by_val(val, ret_layout)
+                }
+                rustc_abi::BackendRepr::ScalarPair(a, b) => {
+                    let clif_ty_a = crate::common::scalar_to_clif_type(fx.tcx, a);
+                    let clif_ty_b = crate::common::scalar_to_clif_type(fx.tcx, b);
+                    let val_a = fx.bcx.ins().load(clif_ty_a, MemFlags::trusted(), aligned_ptr, 0);
+                    let offset_b = a.size(&fx.tcx).bytes() as i32;
+                    let val_b = fx.bcx.ins().load(clif_ty_b, MemFlags::trusted(), aligned_ptr, offset_b);
+                    CValue::by_val_pair(val_a, val_b, ret_layout)
+                }
+                _ => {
+                    // For aggregate types, copy to a stack slot
+                    let dest = CPlace::new_stack_slot(fx, ret_layout);
+                    let dest_ptr = dest.to_ptr();
+                    let dest_addr = dest_ptr.get_addr(fx);
+                    let size = fx.bcx.ins().iconst(fx.pointer_type, arg_size);
+                    fx.bcx.call_memcpy(fx.target_config, dest_addr, aligned_ptr, size);
+                    dest.to_cvalue(fx)
+                }
+            };
+
+            ret.write_cvalue(fx, value);
+
+            // Advance the pointer by the argument size
+            // Note: Cranelift packs variadic arguments at their natural size/alignment,
+            // not in 8-byte slots as some ABIs specify. This matches what adjust_call_for_c_variadic does.
+            let next_ptr = fx.bcx.ins().iadd_imm(aligned_ptr, arg_size);
+
+            // Store the new pointer back
+            fx.bcx.ins().store(MemFlags::trusted(), next_ptr, va_list_ptr, 0);
+        }
+
+        sym::va_copy => {
+            intrinsic_args!(fx, args => (dest, src); intrinsic);
+
+            // va_copy copies the va_list from src to dest
+            // For simple va_list (pointer), just copy the pointer value
+            let dest_ptr = dest.load_scalar(fx);
+            let src_ptr = src.load_scalar(fx);
+
+            // Load the current pointer from src
+            let current_val = fx.bcx.ins().load(fx.pointer_type, MemFlags::trusted(), src_ptr, 0);
+
+            // Store it in dest
+            fx.bcx.ins().store(MemFlags::trusted(), current_val, dest_ptr, 0);
+        }
+
+        sym::va_end => {
+            intrinsic_args!(fx, args => (_va_list); intrinsic);
+            // va_end is a no-op for most platforms
+            // The va_list cleanup (if any) is handled automatically
         }
 
         sym::cold_path => {

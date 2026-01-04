@@ -111,6 +111,7 @@ pub(crate) fn codegen_fn<'tcx>(
         local_map: IndexVec::with_capacity(mir.local_decls.len()),
         caller_location: None, // set by `codegen_fn_prelude`
         exception_slot,
+        va_list_slot: None, // set by `codegen_fn_prelude` for variadic functions
 
         clif_comments,
         inline_asm: String::new(),

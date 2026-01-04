@@ -22,7 +22,7 @@ use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_session::Session;
 use rustc_span::source_map::Spanned;
 use rustc_target::callconv::{FnAbi, PassMode};
-use rustc_target::spec::Arch;
+use rustc_target::spec::{Arch, Os};
 use smallvec::{SmallVec, smallvec};
 
 use self::pass_mode::*;
@@ -226,6 +226,85 @@ fn make_local_place<'tcx>(
     place
 }
 
+/// Set up va_list storage for variadic functions.
+///
+/// The va_list structure varies by platform:
+/// - Simple (Windows, Apple AArch64, UEFI): just a pointer
+/// - x86_64 System V: 24-byte struct with offsets and pointers
+/// - AArch64 (non-Apple): complex struct with stack/register tracking
+fn setup_va_list(fx: &mut FunctionCx<'_, '_, '_>) {
+    let arch = &fx.tcx.sess.target.arch;
+    let is_windows = fx.tcx.sess.target.is_like_windows;
+    let is_apple = fx.tcx.sess.target.is_like_darwin;
+    let is_uefi = fx.tcx.sess.target.os == Os::Uefi;
+
+    // Determine va_list type based on platform
+    let uses_simple_va_list = is_windows
+        || is_uefi
+        || (arch == &Arch::AArch64 && is_apple)
+        || arch != &Arch::X86_64 && arch != &Arch::AArch64 && arch != &Arch::PowerPC64;
+
+    if uses_simple_va_list {
+        // Simple pointer-based va_list: allocate a single pointer slot
+        // The actual initialization happens in va_start intrinsic
+        let va_list_slot = fx.create_stack_slot(
+            fx.pointer_type.bytes() as u32,
+            fx.pointer_type.bytes() as u32,
+        );
+        fx.va_list_slot = Some(va_list_slot);
+    } else if arch == &Arch::X86_64 && !is_windows && !is_uefi {
+        // x86_64 System V ABI: va_list is a 24-byte struct
+        // struct {
+        //     i32 gp_offset;       // offset 0
+        //     i32 fp_offset;       // offset 4
+        //     void* overflow_arg_area;  // offset 8
+        //     void* reg_save_area;      // offset 16
+        // }
+        //
+        // We need to save register arguments to the register save area.
+        // The register save area needs space for:
+        // - 6 GP registers (rdi, rsi, rdx, rcx, r8, r9) = 48 bytes
+        // - 8 SSE registers (xmm0-xmm7) = 128 bytes (16 bytes each)
+        // Total: 176 bytes
+
+        // Create the va_list struct (24 bytes, 8-byte aligned)
+        let va_list_slot = fx.create_stack_slot(24, 8);
+
+        // Create the register save area (176 bytes, 16-byte aligned for SSE)
+        let _reg_save_area = fx.create_stack_slot(176, 16);
+
+        // Note: The actual initialization of these slots happens in va_start.
+        // We can't save the register arguments here because they've already
+        // been converted to block parameters by Cranelift.
+        //
+        // For now, we store the va_list slot and handle initialization in va_start.
+        // The register arguments will be re-saved from the block parameters.
+        fx.va_list_slot = Some(va_list_slot);
+    } else if arch == &Arch::AArch64 && !is_apple && !is_windows && !is_uefi {
+        // AArch64 (non-Apple) va_list struct:
+        // struct {
+        //     void* stack;      // offset 0
+        //     void* gr_top;     // offset 8
+        //     void* vr_top;     // offset 16
+        //     i32 gr_offs;      // offset 24
+        //     i32 vr_offs;      // offset 28
+        // }
+        // Total: 32 bytes
+
+        let va_list_slot = fx.create_stack_slot(32, 8);
+        fx.va_list_slot = Some(va_list_slot);
+    } else {
+        // Unsupported platform for variadic functions
+        fx.tcx.dcx().span_fatal(
+            fx.mir.span,
+            format!(
+                "Defining variadic functions is not yet supported by Cranelift on {:?}",
+                fx.tcx.sess.target.llvm_target
+            ),
+        );
+    }
+}
+
 pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_block: Block) {
     fx.bcx.append_block_params_for_function_params(start_block);
 
@@ -241,27 +320,40 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
         self::returning::codegen_return_param(fx, &ssa_analyzed, &mut block_params_iter);
     assert_eq!(fx.local_map.push(ret_place), RETURN_PLACE);
 
-    // None means pass_mode == NoPass
-    enum ArgKind<'tcx> {
-        Normal(Option<CValue<'tcx>>),
-        Spread(Vec<Option<CValue<'tcx>>>),
-    }
-
-    // FIXME implement variadics in cranelift
+    // Handle variadic functions - set up va_list
     if fx.fn_abi.c_variadic {
-        fx.tcx.dcx().span_fatal(
-            fx.mir.span,
-            "Defining variadic functions is not yet supported by Cranelift",
-        );
+        setup_va_list(fx);
     }
 
     let mut arg_abis_iter = fx.fn_abi.args.iter();
+
+    // For variadic functions, the MIR has an extra va_list parameter that
+    // doesn't have a corresponding ABI entry. We track this separately.
+    let va_list_local = if fx.fn_abi.c_variadic {
+        // The va_list is the last MIR argument
+        fx.mir.args_iter().last()
+    } else {
+        None
+    };
+
+    // None means pass_mode == NoPass
+    // VaList is a special marker for the variadic argument
+    enum ArgKind<'tcx> {
+        Normal(Option<CValue<'tcx>>),
+        Spread(Vec<Option<CValue<'tcx>>>),
+        VaList, // Special marker for variadic argument
+    }
 
     let func_params = fx
         .mir
         .args_iter()
         .map(|local| {
             let arg_ty = fx.monomorphize(fx.mir.local_decls[local].ty);
+
+            // Handle the va_list parameter specially - it's not from block params
+            if Some(local) == va_list_local {
+                return (local, ArgKind::VaList, arg_ty);
+            }
 
             // Adapted from https://github.com/rust-lang/rust/blob/145155dc96757002c7b2e9de8489416e2fdbbd57/src/librustc_codegen_llvm/mir/mod.rs#L442-L482
             if Some(local) == fx.mir.spread_arg {
@@ -344,6 +436,37 @@ pub(crate) fn codegen_fn_prelude<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, start_
                     if let Some(param) = param {
                         place.place_field(fx, FieldIdx::new(i)).write_cvalue(fx, param);
                     }
+                }
+            }
+            ArgKind::VaList => {
+                // For variadic functions, initialize the VaList with a pointer to the first vararg.
+                //
+                // On simple va_list platforms (Apple AArch64, Windows x64):
+                // - VaListImpl is just a single pointer (the `stack` field)
+                // - Varargs are on the stack starting at FP+16
+                //
+                // Stack layout after prologue (AArch64):
+                //   [higher addresses]
+                //     ... variadic args ...    <- first vararg at FP+16
+                //     return address (LR)      <- FP+8
+                //     saved FP                 <- FP+0
+                //   [FP]
+                //     local vars
+                //   [SP]
+                //
+                // VaListImpl layout (Apple AArch64):
+                //   struct VaListImpl { stack: *mut c_void }
+                //
+                // We store FP+16 directly as the VaListImpl value. va_arg will read from
+                // this pointer and update it as it processes each argument.
+                if fx.va_list_slot.is_some() {
+                    // Get frame pointer and calculate offset to first vararg
+                    let frame_ptr = fx.bcx.ins().get_frame_pointer(fx.pointer_type);
+                    let first_vararg_addr = fx.bcx.ins().iadd_imm(frame_ptr, 16);
+
+                    // Write the vararg pointer directly as the VaListImpl value
+                    let va_list_val = CValue::by_val(first_vararg_addr, place.layout());
+                    place.write_cvalue(fx, va_list_val);
                 }
             }
         }

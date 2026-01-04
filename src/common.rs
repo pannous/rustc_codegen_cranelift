@@ -293,6 +293,11 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     /// During cleanup the exception pointer will be stored in this variable.
     pub(crate) exception_slot: Variable,
 
+    /// For variadic functions, this holds the va_list storage pointer.
+    /// On x86-64 System V, this points to a 24-byte struct.
+    /// On simpler ABIs (Windows x64, Apple AArch64), this is a simple stack pointer.
+    pub(crate) va_list_slot: Option<Pointer>,
+
     pub(crate) clif_comments: crate::pretty_clif::CommentWriter,
 
     pub(crate) inline_asm: String,

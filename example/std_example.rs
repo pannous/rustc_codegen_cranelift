@@ -1,4 +1,5 @@
 #![feature(
+    c_variadic,
     core_intrinsics,
     coroutines,
     stmt_expr_attributes,
@@ -180,6 +181,9 @@ fn main() {
     static STATIC_WITH_MAYBE_NESTED_BOX: &Option<Box<str>> = &no_str();
 
     println!("{:?}", STATIC_WITH_MAYBE_NESTED_BOX);
+
+    // Test variadic function support
+    run_variadic_tests();
 }
 
 fn panic(_: u128) {
@@ -613,4 +617,61 @@ fn map(a: Option<(u8, Box<Instruction>)>) -> Option<Box<Instruction>> {
         None => None,
         Some((_, instr)) => Some(instr),
     }
+}
+
+// Test variadic function support
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "uefi",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+mod variadic_tests {
+    // A simple variadic function that sums integers
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe extern "C" fn sum_ints(count: i32, mut args: ...) -> i64 {
+        let mut sum: i64 = 0;
+        for _ in 0..count {
+            sum += args.arg::<i32>() as i64;
+        }
+        sum
+    }
+
+    pub fn test_variadic() {
+        unsafe {
+            // Test with 3 arguments
+            let result = sum_ints(3, 10i32, 20i32, 30i32);
+            assert_eq!(result, 60, "sum_ints(3, 10, 20, 30) should be 60");
+
+            // Test with 0 arguments
+            let result = sum_ints(0);
+            assert_eq!(result, 0, "sum_ints(0) should be 0");
+
+            // Test with 1 argument
+            let result = sum_ints(1, 42i32);
+            assert_eq!(result, 42, "sum_ints(1, 42) should be 42");
+
+            println!("Variadic function tests passed!");
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "uefi",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+fn run_variadic_tests() {
+    variadic_tests::test_variadic();
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "uefi",
+    all(target_arch = "aarch64", target_vendor = "apple")
+)))]
+fn run_variadic_tests() {
+    println!("Variadic tests skipped on this platform");
 }
