@@ -27,6 +27,8 @@ pub(crate) struct GlobalAsmContext<'a, 'tcx> {
     pub target_config: TargetFrontendConfig,
     /// Counter for generating unique wrapper names
     pub global_asm_sym_index: &'a mut u32,
+    /// CGU name for unique wrapper function names across CGUs
+    pub cgu_name: &'a str,
 }
 
 impl<'tcx> AsmCodegenMethods<'tcx> for GlobalAsmContext<'_, 'tcx> {
@@ -43,6 +45,7 @@ impl<'tcx> AsmCodegenMethods<'tcx> for GlobalAsmContext<'_, 'tcx> {
             self.module,
             self.target_config,
             self.global_asm_sym_index,
+            self.cgu_name,
             template,
             operands,
             options,
@@ -108,6 +111,7 @@ fn codegen_global_asm_inner<'tcx>(
     module: &mut dyn Module,
     target_config: TargetFrontendConfig,
     global_asm_sym_index: &mut u32,
+    cgu_name: &str,
     template: &[InlineAsmTemplatePiece],
     operands: &[GlobalAsmOperandRef<'tcx>],
     options: InlineAsmOptions,
@@ -143,8 +147,9 @@ fn codegen_global_asm_inner<'tcx>(
                         // Pass a wrapper rather than the function itself as the function itself
                         // may not be exported from the main codegen unit and may thus be
                         // unreachable from the object file created by an external assembler.
+                        // Include CGU name to ensure uniqueness across codegen units.
                         let wrapper_name =
-                            format!("__global_asm_sym_wrapper{}", *global_asm_sym_index);
+                            format!("__global_asm_sym_wrapper_{}_{}", cgu_name.replace(['.', '-'], "_"), *global_asm_sym_index);
                         *global_asm_sym_index += 1;
                         let sig =
                             get_function_sig(tcx, target_config.default_call_conv, instance);

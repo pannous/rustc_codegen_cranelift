@@ -535,6 +535,7 @@ fn codegen_cgu_content(
                             module,
                             target_config,
                             global_asm_sym_index: &mut global_asm_sym_index,
+                            cgu_name: cgu_name.as_str(),
                         },
                         instance,
                         MonoItemData {
@@ -574,6 +575,7 @@ fn codegen_cgu_content(
                         module,
                         target_config,
                         global_asm_sym_index: &mut global_asm_sym_index,
+                        cgu_name: cgu_name.as_str(),
                     },
                     item_id,
                 );
